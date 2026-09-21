@@ -6,6 +6,12 @@
 <meta name="color-scheme" content="light only">
 <title>董博训练数据库</title>
 <style>
+  /* Safari 下拉回弹修复：禁止页面级下拉回弹，避免滚动到底卡死 */
+  html,body{
+    overscroll-behavior-y: none;
+    -webkit-overflow-scrolling: touch;
+  }
+
   /* ============ 全局基础样式 ============ */
   :root{
     --primary:#38bdf8;          /* 主色调：浅蓝 */
@@ -100,6 +106,8 @@
   .subform-title{font-weight:700; color:#075985; margin-bottom:8px;}
 
   .form-actions{display:flex; gap:10px; margin-top:6px; flex-wrap:wrap;}
+  /* 底部空白边距：防止保存按钮贴底或被移动端底部Tab遮挡（电脑端/手机端均可见） */
+  .bottom-spacer{height:180px;}
 
   /* ============ 按钮 ============ */
   .btn{
@@ -463,6 +471,8 @@
         </div>
       </form>
     </div>
+    <!-- 保存身体测量按钮下方的底部空白，避免贴底、被遮挡、滚动到底卡死 -->
+    <div class="bottom-spacer" aria-hidden="true"></div>
   </section>
 
   <!-- ===================== 页面：日历视图 ===================== -->
@@ -1323,85 +1333,391 @@ $('exportCsvBtn').addEventListener('click', function(){
   showToast('导出成功，CSV 文件已下载', 'success');
 });
 
-// ===================== 导出 PDF（新窗口 + print） =====================
-function escapeJsonForScript(obj){
-  // 防止数据中的 < 提前关闭 script 标签
-  return JSON.stringify(obj).replace(/</g, '\\u003c');
+// ===================== 导出 PDF（原生 Canvas 绘制 + 直接下载，不唤起打印窗口） =====================
+
+// 下载 Blob 对象（用于 PDF 文件下载）
+function downloadBlobObject(blob, filename){
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  setTimeout(function(){ URL.revokeObjectURL(url); }, 1000);
 }
-$('exportPdfBtn').addEventListener('click', function(){
-  if(records.length === 0){ showToast('暂无数据可导出', 'error'); return; }
+
+// 将 JPEG Data URL 解码为字节数组（用于写入 PDF 二进制流）
+function jpegDataUrlToBytes(dataUrl){
+  var b64 = dataUrl.split(',')[1];
+  var bin = atob(b64);
+  var bytes = new Uint8Array(bin.length);
+  for(var i=0;i<bin.length;i++){ bytes[i] = bin.charCodeAt(i); }
+  return bytes;
+}
+
+// 将多个 JPEG 页面图片组装为多页 PDF（每页一张整页图片）
+function buildPDFFromPages(images, pageW, pageH){
+  var N = images.length;
+  var total = 2 + N * 3; // Catalog + Pages + 每页 image/page/content 三个对象
+  var bytes = [];
+  var offsets = new Array(total + 1).fill(0);
+
+  function out(str){ for(var i=0;i<str.length;i++){ bytes.push(str.charCodeAt(i) & 0xff); } }
+  function outBytes(u8){ for(var i=0;i<u8.length;i++){ bytes.push(u8[i]); } }
+
+  out('%PDF-1.4\n');
+
+  // 对象 1：Catalog
+  offsets[1] = bytes.length;
+  out('1 0 obj\n<< /Type /Catalog /Pages 2 0 R >>\nendobj\n');
+
+  // 对象 2：Pages
+  var kids = [];
+  for(var i=0;i<N;i++){ kids.push((4 + i*2) + ' 0 R'); }
+  offsets[2] = bytes.length;
+  out('2 0 obj\n<< /Type /Pages /Kids [' + kids.join(' ') + '] /Count ' + N + ' >>\nendobj\n');
+
+  for(var j=0;j<N;j++){
+    var imgNum = 3 + j*2;
+    var pageNum = 4 + j*2;
+    var contNum = 3 + N*2 + j;
+    var img = images[j];
+    var jpegBytes = jpegDataUrlToBytes(img.dataUrl);
+
+    offsets[imgNum] = bytes.length;
+    out(imgNum + ' 0 obj\n<< /Type /XObject /Subtype /Image /Width ' + img.w + ' /Height ' + img.h + ' /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode /Length ' + jpegBytes.length + ' >>\nstream\n');
+    outBytes(jpegBytes);
+    out('\nendstream\nendobj\n');
+
+    offsets[pageNum] = bytes.length;
+    out(pageNum + ' 0 obj\n<< /Type /Page /Parent 2 0 R /MediaBox [0 0 ' + pageW + ' ' + pageH + '] /Resources << /XObject << /Im0 ' + imgNum + ' 0 R >> >> /Contents ' + contNum + ' 0 R >>\nendobj\n');
+
+    var content = 'q ' + pageW + ' 0 0 ' + pageH + ' 0 0 cm /Im0 Do Q';
+    offsets[contNum] = bytes.length;
+    out(contNum + ' 0 obj\n<< /Length ' + content.length + ' >>\nstream\n' + content + '\nendstream\nendobj\n');
+  }
+
+  var xref = bytes.length;
+  out('xref\n0 ' + (total + 1) + '\n');
+  out('0000000000 65535 f \n');
+  for(var k=1;k<=total;k++){
+    var off = offsets[k];
+    var t = String(off);
+    while(t.length < 10) t = '0' + t;
+    out(t + ' 00000 n \n');
+  }
+  out('trailer\n<< /Size ' + (total + 1) + ' /Root 1 0 R >>\nstartxref\n' + xref + '\n%%EOF');
+
+  return new Blob([new Uint8Array(bytes)], {type:'application/pdf'});
+}
+
+// 文本按字符换行（适配中文与数字混合内容）
+function wrapTextForPDF(ctx, text, maxW){
+  var str = String(text == null ? '' : text);
+  if(str === '') return [''];
+  var lines = [], line = '';
+  for(var i=0;i<str.length;i++){
+    var ch = str[i];
+    var test = line + ch;
+    if(ctx.measureText(test).width > maxW && line !== ''){
+      lines.push(line);
+      line = ch;
+    }else{
+      line = test;
+    }
+  }
+  lines.push(line);
+  return lines;
+}
+
+// 根据列宽比例计算实际像素宽度（最后一列吸收取整误差）
+function computeColWidths(cols, totalW){
+  var sum = 0;
+  cols.forEach(function(c){ sum += c.r; });
+  var widths = cols.map(function(c){ return Math.floor(c.r / sum * totalW); });
+  var used = widths.slice(0, -1).reduce(function(a,b){ return a+b; }, 0);
+  widths[widths.length-1] = totalW - used;
+  return widths;
+}
+
+// 测量表格总高度（用于分页前估算画布高度）
+function measureTableHeight(ctx, cols, rows, totalW, lineH){
+  var widths = computeColWidths(cols, totalW);
+  var padX = 8, padY = 8, headerH = 44;
+  var h = headerH;
+  rows.forEach(function(row){
+    var maxLines = 1;
+    for(var c=0;c<cols.length;c++){
+      var lines = wrapTextForPDF(ctx, row[c], widths[c] - padX*2);
+      if(lines.length > maxLines) maxLines = lines.length;
+    }
+    h += maxLines * lineH + padY * 2;
+  });
+  return h;
+}
+
+// 绘制表格（表头 + 数据行，自动换行）
+function drawTable(ctx, x, y, totalW, cols, rows, lineH){
+  var widths = computeColWidths(cols, totalW);
+  var padX = 8, padY = 8, headerH = 44;
+
+  ctx.fillStyle = '#e0f2fe';
+  ctx.fillRect(x, y, totalW, headerH);
+  ctx.strokeStyle = '#cbd5e1';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(x, y, totalW, headerH);
+
+  var cx = x;
+  for(var c=0;c<cols.length;c++){
+    if(c>0){ ctx.beginPath(); ctx.moveTo(cx, y); ctx.lineTo(cx, y + headerH); ctx.stroke(); }
+    ctx.fillStyle = '#075985';
+    ctx.textAlign = 'left';
+    var hl = wrapTextForPDF(ctx, cols[c].label, widths[c] - padX*2);
+    for(var li=0; li<hl.length && li<2; li++){
+      ctx.fillText(hl[li], cx + padX, y + padY + (li+1)*24);
+    }
+    cx += widths[c];
+  }
+
+  var curY = y + headerH;
+  rows.forEach(function(row){
+    var wrapped = [];
+    var maxLines = 1;
+    for(var c=0;c<cols.length;c++){
+      var lines = wrapTextForPDF(ctx, row[c], widths[c] - padX*2);
+      wrapped.push(lines);
+      if(lines.length > maxLines) maxLines = lines.length;
+    }
+    var rowH = maxLines * lineH + padY*2;
+
+    ctx.fillStyle = '#ffffff';
+    ctx.fillRect(x, curY, totalW, rowH);
+
+    var cx2 = x;
+    for(var c=0;c<cols.length;c++){
+      if(c>0){ ctx.beginPath(); ctx.moveTo(cx2, curY); ctx.lineTo(cx2, curY + rowH); ctx.stroke(); }
+      ctx.fillStyle = '#111827';
+      var lines = wrapped[c];
+      for(var li=0; li<lines.length; li++){
+        ctx.fillText(lines[li], cx2 + padX, curY + padY + (li+1)*lineH - 4);
+      }
+      cx2 += widths[c];
+    }
+    ctx.strokeRect(x, curY, totalW, rowH);
+    curY += rowH;
+  });
+
+  return curY;
+}
+
+// 绘制曲线图（晨起/当日/疲劳，映射到5分制），返回 canvas
+function drawChartCanvas(data){
+  var cw = 1500, ch = 520;
+  var canvas = document.createElement('canvas');
+  canvas.width = cw; canvas.height = ch;
+  var ctx = canvas.getContext('2d');
+
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,cw,ch);
+
+  var pad = {l:80, r:40, t:40, b:80};
+  var w = cw - pad.l - pad.r;
+  var h = ch - pad.t - pad.b;
+  var maxY = 5;
+
+  ctx.font = '18px sans-serif';
+  ctx.strokeStyle = '#e5e7eb';
+  ctx.lineWidth = 1;
+  for(var i=0;i<=5;i++){
+    var yy = pad.t + h - (i/maxY)*h;
+    ctx.beginPath(); ctx.moveTo(pad.l, yy); ctx.lineTo(cw - pad.r, yy); ctx.stroke();
+    ctx.fillStyle = '#6b7280'; ctx.textAlign = 'right';
+    ctx.fillText(String(i), pad.l - 14, yy + 6);
+  }
+  ctx.strokeStyle = '#9ca3af';
+  ctx.beginPath(); ctx.moveTo(pad.l, pad.t); ctx.lineTo(pad.l, pad.t + h); ctx.stroke();
+
+  var series = [
+    {key:'morning', label:'晨起身体状态', color:'#2563eb'},
+    {key:'daily', label:'当日身体状态', color:'#16a34a'},
+    {key:'fatigue', label:'全天疲劳程度(映射到5分制)', color:'#ea580c'}
+  ];
+
+  var xStep = data.length > 1 ? w/(data.length-1) : w/2;
+  ctx.textAlign = 'center';
+  ctx.fillStyle = '#6b7280';
+  data.forEach(function(d,i){
+    var x = pad.l + (data.length>1 ? i*xStep : w/2);
+    ctx.fillText(d.date.length>5 ? d.date.slice(5) : d.date, x, ch - pad.b + 30);
+  });
+
+  series.forEach(function(s){
+    var pts = [];
+    data.forEach(function(d,i){
+      var val = parseFloat(d[s.key]);
+      if(isNaN(val)) return;
+      var yv = (s.key === 'fatigue') ? val/2 : val;
+      var x = pad.l + (data.length>1 ? i*xStep : w/2);
+      var y = pad.t + h - (Math.max(0, Math.min(maxY, yv))/maxY)*h;
+      pts.push([x,y]);
+    });
+    if(pts.length === 0) return;
+    ctx.strokeStyle = s.color;
+    ctx.lineWidth = 3;
+    ctx.beginPath();
+    pts.forEach(function(p,idx){ if(idx) ctx.lineTo(p[0],p[1]); else ctx.moveTo(p[0],p[1]); });
+    ctx.stroke();
+    ctx.fillStyle = s.color;
+    pts.forEach(function(p){ ctx.beginPath(); ctx.arc(p[0],p[1],5,0,Math.PI*2); ctx.fill(); });
+  });
+
+  var lx = pad.l;
+  ctx.textAlign = 'left';
+  series.forEach(function(s){
+    ctx.fillStyle = s.color;
+    ctx.fillRect(lx, 10, 16, 16);
+    ctx.fillStyle = '#111827';
+    ctx.fillText(s.label, lx + 22, 23);
+    lx += 22 + ctx.measureText(s.label).width + 36;
+  });
+
+  return canvas;
+}
+
+// 生成报告分页图片（每页一张 JPEG Data URL）
+function generatePDFReportPages(){
+  var PAGE_W = 1600, PAGE_H = 1130;
+  var MARGIN = 50;
+  var contentW = PAGE_W - MARGIN*2;
+  var lineH = 26;
+  var font = '20px sans-serif';
 
   var daily = sortByDateAsc(records.filter(function(r){ return r.recordType === '每日训练日志'; }));
   var weekly = sortByDateDesc(records.filter(function(r){ return r.recordType === '每周身体测量'; }));
+
   var chartData = daily.map(function(r){
     return {date:r.recordDate, morning:r.morningScore, daily:r.dailyScore, fatigue:r.fatigueScore};
   }).filter(function(d){ return d.morning !== '' || d.daily !== '' || d.fatigue !== ''; });
 
-  var dailyRows = daily.map(function(r){
-    return '<tr><td>' + escapeHtml(r.recordDate) + '</td><td>' + escapeHtml(r.trainingType) + '</td><td>' + escapeHtml(r.sleepHours) + '</td><td>' + escapeHtml(r.awSleepScore) + '</td><td>' + escapeHtml(r.hrMin) + '</td><td>' + escapeHtml(r.hrMax) + '</td><td>' + escapeHtml(r.trainingMaxHR) + '</td><td>' + escapeHtml(r.calories) + '</td><td>' + escapeHtml(r.extraTraining) + '</td><td>' + escapeHtml(r.runContent) + '</td><td>' + escapeHtml(r.runBigGroup) + '</td><td>' + escapeHtml(r.runSmallGroup) + '</td><td>' + escapeHtml(r.runIntensity) + '</td><td>' + escapeHtml(r.runSmallRest) + '</td><td>' + escapeHtml(r.runBigRest) + '</td><td>' + escapeHtml(r.fitnessItems) + '</td><td>' + escapeHtml(r.strengthType) + '</td><td>' + escapeHtml(r.bigStrengthItems) + '</td><td>' + escapeHtml(r.strengthWeights) + '</td><td>' + escapeHtml(r.strengthReps) + '</td><td>' + escapeHtml(r.smallStrengthItems) + '</td><td>' + escapeHtml(r.morningScore) + '</td><td>' + escapeHtml(r.dailyScore) + '</td><td>' + escapeHtml(r.fatigueScore) + '</td><td>' + escapeHtml(r.notes) + '</td></tr>';
-  }).join('');
+  var dailyCols = [
+    {label:'日期', r:0.055}, {label:'训练类型', r:0.06}, {label:'睡眠', r:0.032}, {label:'AW', r:0.028},
+    {label:'静息低', r:0.036}, {label:'静息高', r:0.036}, {label:'最大心率', r:0.042}, {label:'卡路里', r:0.042},
+    {label:'加练', r:0.03}, {label:'跑课内容', r:0.068}, {label:'大组', r:0.028}, {label:'小组', r:0.028},
+    {label:'强度', r:0.024}, {label:'小组间歇', r:0.033}, {label:'大组间歇', r:0.033}, {label:'体能项目', r:0.057},
+    {label:'力量类型', r:0.036}, {label:'大力量项目', r:0.048}, {label:'重量', r:0.05}, {label:'数量', r:0.032},
+    {label:'小力量项目', r:0.05}, {label:'晨起', r:0.024}, {label:'当日', r:0.024}, {label:'疲劳', r:0.024}, {label:'备注', r:0.073}
+  ];
+  var weeklyCols = [
+    {label:'日期', r:0.16}, {label:'体重(kg)', r:0.17}, {label:'腰围(cm)', r:0.17},
+    {label:'臀围(cm)', r:0.17}, {label:'大腿围(cm)', r:0.16}, {label:'小腿围(cm)', r:0.16}
+  ];
 
-  var weeklyRows = weekly.map(function(r){
-    return '<tr><td>' + escapeHtml(r.recordDate) + '</td><td>' + escapeHtml(r.weight) + '</td><td>' + escapeHtml(r.waist) + '</td><td>' + escapeHtml(r.hip) + '</td><td>' + escapeHtml(r.thigh) + '</td><td>' + escapeHtml(r.calf) + '</td></tr>';
-  }).join('');
+  function dailyRow(r){ return [r.recordDate, r.trainingType, r.sleepHours, r.awSleepScore, r.hrMin, r.hrMax, r.trainingMaxHR, r.calories, r.extraTraining, r.runContent, r.runBigGroup, r.runSmallGroup, r.runIntensity, r.runSmallRest, r.runBigRest, r.fitnessItems, r.strengthType, r.bigStrengthItems, r.strengthWeights, r.strengthReps, r.smallStrengthItems, r.morningScore, r.dailyScore, r.fatigueScore, r.notes]; }
+  function weeklyRow(r){ return [r.recordDate, r.weight, r.waist, r.hip, r.thigh, r.calf]; }
 
-  var payload = {chart: chartData};
-  var json = escapeJsonForScript(payload);
+  var dailyRows = daily.map(dailyRow);
+  if(dailyRows.length === 0){ var e1 = new Array(dailyCols.length).fill(''); e1[0] = '暂无数据'; dailyRows.push(e1); }
+  var weeklyRows = weekly.map(weeklyRow);
+  if(weeklyRows.length === 0){ var e2 = new Array(weeklyCols.length).fill(''); e2[0] = '暂无数据'; weeklyRows.push(e2); }
 
-  var html = '<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><title>董博训练数据库报告</title><style>'
-    + '@page{size:A4 landscape;margin:10mm;}'
-    + 'body{font-family:"PingFang SC","Microsoft YaHei",sans-serif;color:#111;font-size:11px;}'
-    + 'h1{font-size:18px;}h2{font-size:14px;margin:16px 0 6px;color:#075985;}'
-    + 'table{border-collapse:collapse;width:100%;table-layout:fixed;word-break:break-all;font-size:9px;}'
-    + 'th,td{border:1px solid #cbd5e1;padding:3px 4px;text-align:left;vertical-align:top;}'
-    + 'th{background:#e0f2fe;color:#075985;}'
-    + '#chartWrap img{width:100%;}'
-    + '</style></head><body>'
-    + '<h1>🏃 董博训练数据库报告</h1>'
-    + '<h2>📈 身体状态与疲劳程度曲线图</h2>'
-    + '<div id="chartWrap"></div>'
-    + '<h2>📝 每日训练日志（按日期升序）</h2>'
-    + '<table><thead><tr>'
-    + '<th>日期</th><th>训练类型</th><th>睡眠</th><th>AW</th><th>静息低</th><th>静息高</th><th>最大心率</th><th>卡路里</th><th>加练</th><th>跑课内容</th><th>大组</th><th>小组</th><th>强度</th><th>小组间歇</th><th>大组间歇</th><th>体能项目</th><th>力量类型</th><th>大力量项目</th><th>重量</th><th>数量</th><th>小力量项目</th><th>晨起</th><th>当日</th><th>疲劳</th><th>备注</th>'
-    + '</tr></thead><tbody>' + (dailyRows || '<tr><td colspan="25">暂无数据</td></tr>') + '</tbody></table>'
-    + '<h2>📏 每周身体测量（按日期降序）</h2>'
-    + '<table><thead><tr><th>日期</th><th>体重(kg)</th><th>腰围(cm)</th><th>臀围(cm)</th><th>大腿围(cm)</th><th>小腿围(cm)</th></tr></thead><tbody>' + (weeklyRows || '<tr><td colspan="6">暂无数据</td></tr>') + '</tbody></table>'
-    + '<script>'
-    + 'var DATA = ' + json + ';'
-    + 'function drawChart(){'
-    + 'var wrap=document.getElementById("chartWrap");'
-    + 'var data=DATA.chart;'
-    + 'if(!data||data.length===0){wrap.innerHTML="<p>暂无评分数据，无法绘制曲线图。</p>";return;}'
-    + 'var canvas=document.createElement("canvas");canvas.width=1100;canvas.height=420;'
-    + 'var ctx=canvas.getContext("2d");'
-    + 'ctx.fillStyle="#ffffff";ctx.fillRect(0,0,canvas.width,canvas.height);'
-    + 'var pad={l:60,r:30,t:30,b:70};var w=canvas.width-pad.l-pad.r;var h=canvas.height-pad.t-pad.b;'
-    + 'var maxY=5;'
-    + 'ctx.font="12px sans-serif";'
-    + 'for(var i=0;i<=5;i++){var y=pad.t+h-(i/maxY)*h;ctx.strokeStyle="#e5e7eb";ctx.beginPath();ctx.moveTo(pad.l,y);ctx.lineTo(canvas.width-pad.r,y);ctx.stroke();ctx.fillStyle="#6b7280";ctx.textAlign="right";ctx.fillText(String(i),pad.l-10,y+4);}'
-    + 'ctx.strokeStyle="#9ca3af";ctx.beginPath();ctx.moveTo(pad.l,pad.t);ctx.lineTo(pad.l,pad.t+h);ctx.stroke();'
-    + 'var series=[{key:"morning",label:"晨起身体状态",color:"#2563eb"},{key:"daily",label:"当日身体状态",color:"#16a34a"},{key:"fatigue",label:"全天疲劳程度(映射到5分制)",color:"#ea580c"}];'
-    + 'var xStep=data.length>1?w/(data.length-1):w/2;'
-    + 'data.forEach(function(d,i){var x=pad.l+(data.length>1?i*xStep:w/2);ctx.fillStyle="#6b7280";ctx.textAlign="center";ctx.fillText(d.date.length>5?d.date.slice(5):d.date,x,canvas.height-pad.b+22);});'
-    + 'series.forEach(function(s){var pts=[];data.forEach(function(d,i){var val=parseFloat(d[s.key]);if(isNaN(val))return;var yv=(s.key==="fatigue")?val/2:val;var x=pad.l+(data.length>1?i*xStep:w/2);var y=pad.t+h-(Math.max(0,Math.min(maxY,yv))/maxY)*h;pts.push([x,y]);});'
-    + 'if(pts.length===0)return;ctx.strokeStyle=s.color;ctx.lineWidth=2;ctx.beginPath();pts.forEach(function(p,idx){if(idx)ctx.lineTo(p[0],p[1]);else ctx.moveTo(p[0],p[1]);});ctx.stroke();ctx.fillStyle=s.color;pts.forEach(function(p){ctx.beginPath();ctx.arc(p[0],p[1],3,0,Math.PI*2);ctx.fill();});});'
-    + 'var lx=pad.l;series.forEach(function(s){ctx.fillStyle=s.color;ctx.fillRect(lx,8,12,12);ctx.fillStyle="#111827";ctx.textAlign="left";ctx.fillText(s.label,lx+16,19);lx+=ctx.measureText(s.label).width+40;});'
-    + 'var img=document.createElement("img");img.src=canvas.toDataURL("image/png");img.style.width="100%";wrap.appendChild(img);'
-    + '}'
-    + 'drawChart();'
-    + 'setTimeout(function(){window.print();},350);'
-    + '<\/script>'
-    + '</body></html>';
+  // 用测量画布估算总高度
+  var measureCanvas = document.createElement('canvas');
+  measureCanvas.width = PAGE_W; measureCanvas.height = 1;
+  var mctx = measureCanvas.getContext('2d');
+  mctx.font = font;
 
-  var w = window.open('', '_blank', 'width=1100,height=760');
-  if(!w){
-    showToast('浏览器拦截了弹窗，请允许本站弹出窗口后重试', 'error');
-    return;
+  var titleH = 80, sectionH = 56;
+  var chartH = chartData.length > 0 ? 520 : 80;
+  var dailyTableH = measureTableHeight(mctx, dailyCols, dailyRows, contentW, lineH);
+  var weeklyTableH = measureTableHeight(mctx, weeklyCols, weeklyRows, contentW, lineH);
+  var footerH = 70;
+
+  var contentTop = MARGIN;
+  var needed = contentTop + titleH + sectionH + chartH + sectionH + dailyTableH + sectionH + weeklyTableH + footerH + MARGIN;
+  var totalH = Math.max(PAGE_H, Math.ceil(needed / PAGE_H) * PAGE_H);
+
+  var canvas = document.createElement('canvas');
+  canvas.width = PAGE_W; canvas.height = totalH;
+  var ctx = canvas.getContext('2d');
+  ctx.fillStyle = '#ffffff';
+  ctx.fillRect(0,0,PAGE_W,totalH);
+  ctx.font = font;
+
+  var y = contentTop;
+
+  // 标题
+  ctx.fillStyle = '#0f172a';
+  ctx.font = 'bold 40px sans-serif';
+  ctx.textAlign = 'left';
+  ctx.fillText('🏃 董博训练数据库报告', MARGIN, y + 34);
+  y += titleH;
+
+  // 曲线图
+  ctx.font = 'bold 28px sans-serif';
+  ctx.fillStyle = '#075985';
+  ctx.fillText('📈 身体状态与疲劳程度曲线图', MARGIN, y + 24);
+  y += sectionH;
+  if(chartData.length > 0){
+    var chartCanvas = drawChartCanvas(chartData);
+    ctx.drawImage(chartCanvas, MARGIN, y, contentW, 520);
+    y += chartH;
+  }else{
+    ctx.font = font;
+    ctx.fillStyle = '#6b7280';
+    ctx.fillText('暂无评分数据，无法绘制曲线图。', MARGIN, y + 24);
+    y += chartH;
   }
-  w.document.open();
-  w.document.write(html);
-  w.document.close();
-  showToast('已打开 PDF 打印窗口，请选择“另存为 PDF”', 'success');
+
+  // 每日训练日志表
+  ctx.font = 'bold 28px sans-serif';
+  ctx.fillStyle = '#075985';
+  ctx.fillText('📝 每日训练日志（按日期升序）', MARGIN, y + 24);
+  y += sectionH;
+  ctx.font = font;
+  y = drawTable(ctx, MARGIN, y, contentW, dailyCols, dailyRows, lineH);
+
+  // 每周身体测量表
+  ctx.font = 'bold 28px sans-serif';
+  ctx.fillStyle = '#075985';
+  ctx.fillText('📏 每周身体测量（按日期降序）', MARGIN, y + 24);
+  y += sectionH;
+  ctx.font = font;
+  y = drawTable(ctx, MARGIN, y, contentW, weeklyCols, weeklyRows, lineH);
+
+  // 页脚
+  ctx.font = font;
+  ctx.fillStyle = '#9ca3af';
+  ctx.textAlign = 'center';
+  ctx.fillText('本报告由「董博训练数据库」生成', PAGE_W/2, y + 30);
+  y += footerH;
+
+  // 按页切分，并导出为 JPEG
+  var pages = [];
+  var pageCount = Math.ceil(totalH / PAGE_H);
+  for(var p=0;p<pageCount;p++){
+    var pageCanvas = document.createElement('canvas');
+    pageCanvas.width = PAGE_W; pageCanvas.height = PAGE_H;
+    var pctx = pageCanvas.getContext('2d');
+    pctx.fillStyle = '#ffffff';
+    pctx.fillRect(0,0,PAGE_W,PAGE_H);
+    pctx.drawImage(canvas, 0, p*PAGE_H, PAGE_W, PAGE_H, 0, 0, PAGE_W, PAGE_H);
+    pages.push({dataUrl: pageCanvas.toDataURL('image/jpeg', 0.92), w: PAGE_W, h: PAGE_H});
+  }
+  return pages;
+}
+
+// 导出 PDF：仅生成并下载文件，不唤起系统打印预览窗口
+$('exportPdfBtn').addEventListener('click', function(){
+  if(records.length === 0){ showToast('暂无数据可导出', 'error'); return; }
+  try{
+    var pages = generatePDFReportPages();
+    var blob = buildPDFFromPages(pages, 842, 595);
+    downloadBlobObject(blob, '董博训练数据库报告_' + todayCompact() + '.pdf');
+    showToast('导出成功，PDF 文件已下载', 'success');
+  }catch(e){
+    showToast('PDF 导出失败：' + e.message, 'error');
+  }
 });
 
 // ===================== JSON 备份与恢复 =====================
